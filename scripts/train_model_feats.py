@@ -1,0 +1,1 @@
+FEATS = ["amount_myr","is_foreign","device_new","hour_of_day","km_from_home","txn_count_1h","amt_ratio_30d","account_age_days","ch_ecom","ch_duitnow","ch_fpx","ch_atm","mc_highrisk","mc_resale","night_txn"]
