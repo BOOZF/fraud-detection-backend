@@ -80,3 +80,40 @@ def test_pdf_is_extracted_page_by_page(client):
         assert any(h["doc"] == name and h["section"].startswith("p") for h in hits)
     finally:
         client.delete(f"/api/documents/{name}")
+
+
+def test_a_document_that_would_need_too_many_chunks_is_rejected_before_embedding(client, monkeypatch):
+    def must_not_embed(texts):
+        raise AssertionError("embedding must not start for an oversized document")
+
+    monkeypatch.setattr(rag, "embed_many", must_not_embed)
+    words = ("alpha bravo charlie delta echo foxtrot golf hotel " * 70_000).encode()  # ~3.5 MB, ~3,000 chunks
+    r = _upload(client, "too_many_chunks.txt", words, "text/plain")
+    assert r.status_code == 413
+    assert "too large to index" in r.json()["detail"]
+    assert "too_many_chunks.txt" not in {d["doc"] for d in client.get("/api/documents").json()}
+
+
+def test_the_original_uploaded_file_can_be_fetched_back(client, probe_cleanup):
+    _upload(client, PROBE, PROBE_TEXT)
+    r = client.get(f"/api/documents/{PROBE}/file")
+    assert r.status_code == 200
+    assert r.content == PROBE_TEXT
+    assert r.headers["content-type"].startswith("text/")
+    client.delete(f"/api/documents/{PROBE}")
+    assert client.get(f"/api/documents/{PROBE}/file").status_code == 404
+    assert client.get("/api/documents/../../.env/file").status_code in (404, 400)
+
+
+def test_pdf_is_served_inline_for_the_browser_viewer(client):
+    name = "pytest_viewer.pdf"
+    pdf = (DOCS / "Fraud_Detection_SOP.pdf").read_bytes()
+    try:
+        assert client.post("/api/documents", files={"file": (name, pdf, "application/pdf")}).status_code == 200
+        r = client.get(f"/api/documents/{name}/file")
+        assert r.status_code == 200
+        assert r.headers["content-type"] == "application/pdf"
+        assert r.headers["content-disposition"].startswith("inline")
+        assert r.content[:5] == b"%PDF-" and len(r.content) == len(pdf)
+    finally:
+        client.delete(f"/api/documents/{name}")

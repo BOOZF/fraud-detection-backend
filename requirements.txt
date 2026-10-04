@@ -7,3 +7,5 @@ pytest
 teradataml
 pyarrow
 openai
+pypdf
+python-multipart

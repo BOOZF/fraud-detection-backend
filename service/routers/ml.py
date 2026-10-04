@@ -23,8 +23,7 @@ def model_card():
     return db.cached("model", _model_card)
 
 
-@router.post("/score")
-def rescore():
+def _rescore() -> dict:
     t0 = time.perf_counter()
     pred = XGBoostPredict(newdata=DataFrame("txn_features"), object=DataFrame("fraud_xgb_model"),
                           id_column="txn_id", model_type="Classification", output_prob=True,
@@ -35,3 +34,8 @@ def rescore():
     rows = db.query("SELECT COUNT(*) FROM txn_scores")[0][0]
     sql = "-- XGBoostPredict over txn_features, persisted to txn_scores\n" + pred.result.show_query()
     return {"rows": int(rows), "seconds": seconds, "sql": sql}
+
+
+@router.post("/score")
+def rescore():
+    return db.run(_rescore)  # holds the Teradata lock; reconnects and retries once if the connection died

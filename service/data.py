@@ -18,3 +18,25 @@ def get_txn(txn_id: int) -> tuple[dict, float, str] | None:
     for k in TXN_COLS:
         txn[k] = float(txn[k]) if k in _FLOATS else str(txn[k]) if k in _STRINGS else int(txn[k])
     return txn, float(prob), sql
+
+
+def get_customer(txn: dict) -> tuple[dict, str]:
+    """Behavioural summary of the customer behind a transaction (no personal identifiers beyond the id)."""
+    sql = (
+        "SELECT COUNT(*) AS n, AVG(t.amount_myr) AS avg_amt, SUM(t.amount_myr) AS total_amt, "
+        "MIN(t.txn_ts) AS first_ts, MAX(t.txn_ts) AS last_ts, "
+        f"SUM(CASE WHEN s.Prob_1 >= {db.ALERT_THRESHOLD} THEN 1 ELSE 0 END) AS flagged "
+        "FROM txn t JOIN txn_scores s ON t.txn_id = s.txn_id "
+        f"WHERE t.customer_id = {int(txn['customer_id'])}"
+    )
+    r = db.query_df(sql).iloc[0]
+    return {
+        "customer_id": txn["customer_id"],
+        "account_age_days": txn["account_age_days"],
+        "txn_count": int(r["n"]),
+        "flagged_count": int(r["flagged"]),
+        "avg_amount_myr": float(r["avg_amt"]),
+        "total_amount_myr": float(r["total_amt"]),
+        "first_txn_ts": str(r["first_ts"]),
+        "last_txn_ts": str(r["last_ts"]),
+    }, sql

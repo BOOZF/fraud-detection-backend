@@ -70,3 +70,16 @@ def test_alerts_default_has_no_probability_threshold_and_is_sorted_descending(cl
     assert len(probs) == 1000  # more than the 255 transactions scoring >= 0.8, and above the old 500 cap
     assert probs == sorted(probs, reverse=True)
     assert min(probs) < 0.8  # the old default threshold is gone
+
+
+def test_alert_detail_has_a_customer_summary_separate_from_the_transaction(client):
+    top = client.get("/api/alerts", params={"limit": 1}).json()[0]
+    d = client.get(f"/api/alerts/{top['txn_id']}").json()
+    c = d["customer"]
+    assert c["customer_id"] == d["txn"]["customer_id"]
+    assert c["txn_count"] >= 1
+    assert c["flagged_count"] >= 1  # the transaction itself scores >= 0.8
+    assert c["avg_amount_myr"] > 0 and c["total_amount_myr"] >= c["avg_amount_myr"]
+    assert c["account_age_days"] == d["txn"]["account_age_days"]
+    assert c["first_txn_ts"] <= c["last_txn_ts"]
+    assert "customer" in d["sql_customer"] or "customer_id" in d["sql_customer"]

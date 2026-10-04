@@ -32,4 +32,6 @@ def alert_detail(txn_id: int):
     if found is None:
         raise HTTPException(status_code=404, detail=f"transaction {txn_id} not found")
     txn, prob, sql = found
-    return {"txn": txn, "prob": prob, "reasons": reasons.for_txn(txn), "sql": sql}
+    customer, customer_sql = data.get_customer(txn)
+    return {"txn": txn, "prob": prob, "reasons": reasons.for_txn(txn), "sql": sql,
+            "customer": customer, "sql_customer": customer_sql}
