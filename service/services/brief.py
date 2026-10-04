@@ -1,6 +1,9 @@
 """Structured copilot brief for one alert: the questions a fraud analyst must settle, answered from the
 uploaded policies with citations (document, section, PDF page). One retrieval query and one LLM call."""
+import hashlib
+import json
 import time
+from functools import lru_cache
 
 from .. import data, db, reasons
 from ..services import llm, rag
@@ -26,7 +29,9 @@ RETRIEVAL = [
 SYSTEM = (
     "You are the fraud-operations copilot for Malaysia XX Bank. For each numbered question, answer ONLY from the "
     "CONTEXT of that question (policy excerpts, each starting with [chunk_id]) plus the TRANSACTION facts. "
-    "Be concrete and brief: at most 60 words per answer, plain sentences. "
+    "Write for a bank fraud analyst who skims: every answer has a VERDICT of at most 8 words (a direct answer such as "
+    "'Yes, report to law enforcement' or 'High risk: respond today') and 2 or 3 POINTS, each one short sentence of at "
+    "most 20 words, the first point being the reason. No filler, no repetition of the question. "
     "When a policy sets a threshold or condition (for example an amount, a probability or a pattern), state the rule "
     "and say whether THIS transaction meets it, using the TRANSACTION facts: a clear 'No, because ...' or "
     "'Yes, because ...' is a valid answer and counts as covered. "
@@ -35,9 +40,31 @@ SYSTEM = (
     "Only if the excerpts say nothing relevant to the question, answer exactly: "
     "Not covered by the uploaded policies; escalate to a fraud supervisor. and use no sources. "
     "Never reveal customer identifiers. Return JSON: "
-    '{"headline": "one-sentence recommended action", "items": [{"question": "<the question>", '
-    '"answer": "<answer>", "sources": [<chunk_id numbers actually used>]}]} with one item per question, in order.'
+    '{"headline": "recommended action as one imperative sentence of at most 14 words", "items": [{"question": "<the question>", '
+    '"verdict": "<verdict>", "points": ["<point>", "<point>"], "sources": [<chunk_id numbers actually used>]}]} '
+    'with one item per question, in order.'
 )
+
+
+NOT_COVERED = "Not covered by the uploaded policies; escalate to a fraud supervisor."
+MAX_VERDICT_WORDS, MAX_POINTS, MAX_POINT_WORDS, MAX_HEADLINE_WORDS = 10, 3, 30, 25
+
+
+def _words(text: str, limit: int) -> str:
+    """One line, at most `limit` words: the layout never has to cope with a runaway answer."""
+    words = text.split()
+    return " ".join(words[:limit]) + ("..." if len(words) > limit else "")
+
+
+def _shape(item: dict) -> tuple[str, list[str]]:
+    points = item.get("points")
+    if not isinstance(points, list):
+        points = [item["answer"]] if str(item.get("answer", "")).strip() else []  # model fell back to the old shape
+    points = [_words(str(p).strip(), MAX_POINT_WORDS) for p in points if str(p).strip()][:MAX_POINTS]
+    verdict = _words(str(item.get("verdict", "")).strip(), MAX_VERDICT_WORDS)
+    if not points:
+        return "Not covered by policies", [NOT_COVERED]
+    return verdict or _words(points[0], 6), points
 
 
 def priority_of(prob: float) -> str | None:
@@ -63,7 +90,7 @@ def _citations(source_ids, retrieved: list[dict]) -> list[dict]:
     return [{k: h[k] for k in ("doc", "chunk_id", "section", "page", "text")} for h in wanted]
 
 
-def build(txn_id: int) -> dict | None:
+def _generate(txn_id: int) -> dict | None:
     found = data.get_txn(txn_id)
     if found is None:
         return None
@@ -84,10 +111,46 @@ def build(txn_id: int) -> dict | None:
     items = []
     for n, (q, retrieved) in enumerate(zip(QUESTIONS, hits)):
         item = answers.get(q) or (ordered[n] if n < len(ordered) and isinstance(ordered[n], dict) else {})
-        answer = str(item.get("answer", "")).strip() or "Not covered by the uploaded policies; escalate to a fraud supervisor."
+        verdict, points = _shape(item)
         sources = [s for s in item.get("sources", []) if isinstance(s, int)]
         cites = _citations(sources, retrieved) or _citations([retrieved[0]["chunk_id"]], retrieved)  # fall back to closest chunk
-        items.append({"question": q, "answer": answer, "citations": cites})
+        items.append({"question": q, "verdict": verdict, "points": points, "answer": " ".join(points), "citations": cites})
+    facts = {k: txn[k] for k in ("amount_myr", "channel", "merchant_cat", "hour_of_day", "txn_ts")}
     return {"txn_id": txn_id, "prob": prob, "priority": priority_of(prob),
-            "headline": str(result.get("headline", "")).strip() or "Review this alert per the fraud SOP.",
-            "items": items, "retrieval_ms": retrieval_ms, "llm_ms": llm_ms}
+            "headline": _words(str(result.get("headline", "")).strip(), MAX_HEADLINE_WORDS) or "Review this alert per the fraud SOP.",
+            "facts": facts, "indicators": rs, "items": items, "retrieval_ms": retrieval_ms, "llm_ms": llm_ms}
+
+
+# ---------- stored briefs: an alert's brief is generated once and then read back, so it never changes ----------
+
+CACHE_DDL = ("CREATE TABLE copilot_briefs (txn_id INTEGER NOT NULL, kb_key VARCHAR(64), "
+             "payload CLOB CHARACTER SET UNICODE, created_at TIMESTAMP(0)) PRIMARY INDEX (txn_id)")
+
+
+def kb_key() -> str:
+    """Fingerprint of the knowledge base. A stored brief is only valid for the documents it was written from."""
+    rows = db.query("SELECT doc, chunks, CAST(uploaded_at AS VARCHAR(19)) FROM policy_docs ORDER BY doc")
+    return hashlib.sha256(json.dumps(rows, default=str).encode()).hexdigest()[:32]
+
+
+@lru_cache(maxsize=1)
+def _ensure_cache_table() -> bool:
+    try:
+        db.execute(CACHE_DDL)
+    except Exception:
+        pass  # already exists
+    return True
+
+
+def build(txn_id: int) -> dict | None:
+    _ensure_cache_table()
+    key = kb_key()
+    rows = db.query(f"SELECT payload FROM copilot_briefs WHERE txn_id = {int(txn_id)} AND kb_key = '{key}'")
+    if rows:
+        return json.loads(rows[0][0])
+    result = _generate(txn_id)
+    if result is not None:
+        db.execute(f"DELETE FROM copilot_briefs WHERE txn_id = {int(txn_id)}")
+        db.execute("INSERT INTO copilot_briefs VALUES (?, ?, ?, CURRENT_TIMESTAMP(0))",
+                   [(int(txn_id), key, json.dumps(result))])
+    return result

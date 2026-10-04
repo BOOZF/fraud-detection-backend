@@ -16,11 +16,14 @@ def complete(system: str, user: str) -> str:
     return r.choices[0].message.content.strip()
 
 
+SEED = 20261004  # fixed so the same input gives the same wording as far as the model allows
+
+
 def complete_json(system: str, user: str) -> dict:
     s = get_settings()
     client = OpenAI(api_key=s.openai_api_key, timeout=90)
     r = client.chat.completions.create(
-        model=s.llm_model, temperature=0.1, response_format={"type": "json_object"},
+        model=s.llm_model, temperature=0, seed=SEED, response_format={"type": "json_object"},
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user}])
     return json.loads(r.choices[0].message.content)
 
@@ -30,4 +33,4 @@ def chat(messages: list[dict], tools: list[dict] | None = None):
     s = get_settings()
     client = OpenAI(api_key=s.openai_api_key, timeout=90)
     kwargs = {"tools": tools, "tool_choice": "auto"} if tools else {}
-    return client.chat.completions.create(model=s.llm_model, temperature=0.1, messages=messages, **kwargs).choices[0].message
+    return client.chat.completions.create(model=s.llm_model, temperature=0, seed=SEED, messages=messages, **kwargs).choices[0].message

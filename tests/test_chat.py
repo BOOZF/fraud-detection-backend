@@ -1,8 +1,11 @@
 import re
+from pathlib import Path
 
 import pytest
 
 from service.services import llm
+
+KNOWLEDGE_BASE = {p.name for p in (Path(__file__).resolve().parent.parent / "docs").glob("*.pdf")}
 
 
 def ask(client, text, context=None, history=()):
@@ -45,7 +48,7 @@ def test_chat_answers_policy_questions_from_the_pdf_with_page_citations(client):
     r = ask(client, "Is an alien's participation in an administrative investigation voluntary?")  # only PDF page 45 says so
     body = r.json()
     assert "voluntary" in body["answer"].lower()
-    assert body["citations"] and all(c["doc"] == "Fraud_Detection_SOP.pdf" for c in body["citations"])
+    assert body["citations"] and all(c["doc"] in KNOWLEDGE_BASE for c in body["citations"])
     assert {"doc", "chunk_id", "section", "page", "text"} <= set(body["citations"][0])
     assert any(45 in pages_in(c["section"]) for c in body["citations"]), [c["section"] for c in body["citations"]]
 

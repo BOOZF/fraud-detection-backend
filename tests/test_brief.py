@@ -1,4 +1,5 @@
 import time
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -20,6 +21,7 @@ def top_txn(client):
 
 
 PDF = "Fraud_Detection_SOP.pdf"
+KNOWLEDGE_BASE = {p.name for p in (Path(__file__).resolve().parent.parent / "docs").glob("*.pdf")}
 Q_VOLUNTARY = "Is an alien's participation in an administrative investigation voluntary?"  # only page 45 says so
 Q_REFERRAL = "What is the Fraud Referral Sheet used for?"  # pages 6, 15, 56, 71, 106 of the PDF mention it
 REFERRAL_PAGES = {6, 15, 56, 71, 106}
@@ -63,7 +65,7 @@ def test_brief_answers_the_standard_questions_with_pdf_page_citations(client, to
         assert len(item["answer"].split()) <= 90, "answers are meant to be brief (prompt asks for <= 60 words)"
         assert item["citations"], f"no citation for: {item['question']}"
         for c in item["citations"]:
-            assert c["doc"] == PDF  # the PDF is the only knowledge source
+            assert c["doc"] in KNOWLEDGE_BASE  # only the ingested PDFs are knowledge sources
             assert isinstance(c["chunk_id"], int) and c["text"].strip()
             assert 1 <= c["page"] <= 131 and c["section"].startswith("p")
 
@@ -96,6 +98,7 @@ def test_brief_reports_502_when_the_llm_is_down(client, monkeypatch):
     db.clear_cache()
     monkeypatch.setattr(llm, "complete_json", boom)
     top = client.get("/api/alerts", params={"limit": 1}).json()[0]["txn_id"]
+    db.execute(f"DELETE FROM copilot_briefs WHERE txn_id = {top}")  # an alert whose brief was never generated
     assert client.post(f"/api/alerts/{top}/brief").status_code == 502
 
 

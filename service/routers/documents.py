@@ -1,7 +1,8 @@
-from fastapi import APIRouter, HTTPException, UploadFile
+from fastapi import APIRouter, HTTPException, Response, UploadFile
 from fastapi.responses import FileResponse
 
-from ..services import documents
+from .. import db
+from ..services import documents, highlight
 
 router = APIRouter(prefix="/api")
 
@@ -36,7 +37,8 @@ MEDIA_TYPES = {"pdf": "application/pdf", "md": "text/markdown; charset=utf-8", "
 
 
 @router.get("/documents/{name}/file")
-def document_file(name: str):
+def document_file(name: str, chunk: int | None = None):
+    """The original file. With ?chunk=<id> (a PDF citation) the cited passage is highlighted on its page."""
     try:
         path = documents.file_path(name)
         kind = documents.kind_of(path.name)
@@ -44,4 +46,11 @@ def document_file(name: str):
         _fail(e)
     if not path.is_file():
         raise HTTPException(status_code=404, detail=f"File for '{name}' not found")
-    return FileResponse(path, media_type=MEDIA_TYPES[kind], headers={"Content-Disposition": f'inline; filename="{path.name}"'})
+    headers = {"Content-Disposition": f'inline; filename="{path.name}"'}
+    if chunk is not None and kind == "pdf":
+        rows = db.query(f"SELECT section, text FROM policy_chunks WHERE chunk_id = {int(chunk)} AND doc = '{documents._q(path.name)}'")
+        if not rows:
+            raise HTTPException(status_code=404, detail=f"Chunk {chunk} does not belong to '{name}'")
+        section, text = rows[0]
+        return Response(highlight.highlighted_pdf(path, section, text), media_type=MEDIA_TYPES[kind], headers=headers)
+    return FileResponse(path, media_type=MEDIA_TYPES[kind], headers=headers)

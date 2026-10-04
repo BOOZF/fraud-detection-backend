@@ -29,6 +29,15 @@ The copilot answers from the PDF(s) in `docs/` (currently `Fraud_Detection_SOP.p
 `python scripts/ingest_policies.py` rebuilds it from `docs/` (reset + ingest). Cleaning, chunking (800 chars) and hybrid search
 (vector candidates from Teradata, re-ranked by keyword overlap) are in `service/services/documents.py` and `service/services/rag.py`.
 
+## Copilot behaviour
+
+* **Citations are highlighted.** `GET /api/documents/{name}/file?chunk=<id>` returns the PDF with the cited passage highlighted as real
+  PDF annotations (`service/services/highlight.py`, PyMuPDF); the viewer opens it at the cited page.
+* **Briefs never change.** A brief is generated once (temperature 0, fixed seed), stored in Teradata (`copilot_briefs`) and read back; it is
+  regenerated only when the document set changes. Shape: a short verdict + up to 3 bullet points per question.
+* **Chat guardrails** (`service/guardrails.py`): prompt-injection / secret screening, PII masking in and out, a topic gate (fraud at this bank only,
+  with a document-similarity second opinion), and a fixed refusal. Overview questions answer as a table; questions about one alert as prose.
+
 ## API
 
 `/api/health`, `/api/kpis`, `/api/model`, `/api/alerts` (all alerts, highest probability first), `/api/alerts/{id}` (+ customer),
