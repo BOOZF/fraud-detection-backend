@@ -49,3 +49,54 @@ def test_changing_the_knowledge_base_invalidates_stored_briefs(client, top_txn, 
         assert brief_service.kb_key() != key_before
     finally:
         client.delete("/api/documents/pytest_kb_probe.md")
+
+
+# ---- an incomplete model reply must never be shown (or stored) as "not covered by the policies" ----
+
+def _full_reply(brief_service):
+    return {"headline": "Escalate to a fraud lead now",
+            "items": [{"question": q, "verdict": f"Verdict {n}", "points": [f"Point {n}"], "sources": []}
+                      for n, q in enumerate(brief_service.QUESTIONS, 1)]}
+
+
+def _fresh_txn(client):
+    """An alert with no stored brief yet, so the model really is called."""
+    txn = client.get("/api/alerts", params={"limit": 3}).json()[2]["txn_id"]
+    db.execute(f"DELETE FROM copilot_briefs WHERE txn_id = {txn}")
+    db.clear_cache()
+    return txn
+
+
+def test_an_incomplete_model_reply_is_asked_again_instead_of_shown_as_not_covered(client, monkeypatch):
+    from service.services import brief as brief_service, llm
+    txn, calls = _fresh_txn(client), []
+
+    def flaky(system, user):
+        calls.append(1)
+        full = _full_reply(brief_service)
+        return {**full, "items": full["items"][-1:]} if len(calls) == 1 else full  # first reply: only the last question
+
+    monkeypatch.setattr(llm, "complete_json", flaky)
+    items = client.post(f"/api/alerts/{txn}/brief").json()["items"]
+    assert len(calls) == 1 + 4  # the whole set once, then each of the four missing questions on its own
+    assert [i["verdict"] for i in items] == [f"Verdict {n}" for n in range(1, 6)]
+    assert not any("Not covered" in i["verdict"] for i in items)
+
+
+def test_a_model_that_keeps_returning_incomplete_replies_is_an_error_and_nothing_is_stored(client, monkeypatch):
+    from service.services import brief as brief_service, llm
+    txn = _fresh_txn(client)
+    monkeypatch.setattr(llm, "complete_json", lambda s, u: {**_full_reply(brief_service), "items": []})
+    assert client.post(f"/api/alerts/{txn}/brief").status_code == 502
+    assert db.query(f"SELECT COUNT(*) FROM copilot_briefs WHERE txn_id = {txn}")[0][0] == 0
+
+
+def test_when_the_model_says_a_question_is_not_covered_that_is_kept(client, monkeypatch):
+    from service.services import brief as brief_service, llm
+    txn = _fresh_txn(client)
+    reply = _full_reply(brief_service)
+    reply["items"][3] = {"question": brief_service.QUESTIONS[3], "verdict": "Not covered by policies",
+                         "points": [brief_service.NOT_COVERED], "sources": []}
+    monkeypatch.setattr(llm, "complete_json", lambda s, u: reply)
+    items = client.post(f"/api/alerts/{txn}/brief").json()["items"]
+    assert items[3]["verdict"] == "Not covered by policies" and items[0]["verdict"] == "Verdict 1"

@@ -1,6 +1,7 @@
 """Structured copilot brief for one alert: the questions a fraud analyst must settle, answered from the
 uploaded policies with citations (document, section, PDF page). One retrieval query and one LLM call."""
 import hashlib
+from concurrent.futures import ThreadPoolExecutor
 import json
 import time
 from functools import lru_cache
@@ -56,6 +57,26 @@ def _words(text: str, limit: int) -> str:
     return " ".join(words[:limit]) + ("..." if len(words) > limit else "")
 
 
+SINGLE_ATTEMPTS = 2
+
+
+def _usable(item) -> bool:
+    return isinstance(item, dict) and (bool(item.get("points")) or bool(str(item.get("answer", "")).strip()))
+
+
+def _answers(result: dict, asked: list[int]) -> dict[int, dict]:
+    """The usable items of a reply, keyed by question index. A reply may skip questions (models sometimes answer
+    just one), so the caller asks again for whatever is still missing."""
+    items = result.get("items")
+    if not isinstance(items, list):
+        return {}
+    by_question = {str(i.get("question", "")).strip(): i for i in items if _usable(i)}
+    found = {i: by_question[QUESTIONS[i]] for i in asked if QUESTIONS[i] in by_question}
+    if not found and len(items) == len(asked) and all(_usable(i) for i in items):
+        found = dict(zip(asked, items))  # same count, question text reworded: trust the order
+    return found
+
+
 def _shape(item: dict) -> tuple[str, list[str]]:
     points = item.get("points")
     if not isinstance(points, list):
@@ -71,13 +92,15 @@ def priority_of(prob: float) -> str | None:
     return "P1" if prob >= 0.9 else "P2" if prob >= db.ALERT_THRESHOLD else None
 
 
-def _prompt(txn: dict, prob: float, rs: list[str], hits: list[list[dict]]) -> str:
+def _prompt(txn: dict, prob: float, rs: list[str], hits: list[list[dict]], only: list[int] | None = None) -> str:
     facts = (f"amount RM{txn['amount_myr']:.2f}, channel {txn['channel']}, merchant {txn['merchant_cat']}, "
              f"new_device={txn['device_new']}, foreign={txn['is_foreign']}, hour={txn['hour_of_day']}, "
              f"amount_vs_30d_avg={txn['amt_ratio_30d']:.1f}x, txns_last_hour={txn['txn_count_1h']}, "
              f"account_age_days={txn['account_age_days']}")
     blocks = []
-    for n, (q, chunk_hits) in enumerate(zip(QUESTIONS, hits), start=1):
+    wanted = range(len(QUESTIONS)) if only is None else only
+    for n, i in enumerate(wanted, start=1):
+        q, chunk_hits = QUESTIONS[i], hits[i]
         ctx = "\n".join(f"[{h['chunk_id']}] ({h['doc']} {h['section']}) {h['text']}" for h in chunk_hits)
         blocks.append(f"QUESTION {n}: {q}\nCONTEXT {n}:\n{ctx}")
     return (f"TRANSACTION: {facts}\nMODEL: fraud probability {prob:.2f} (priority {priority_of(prob)}). "
@@ -103,21 +126,34 @@ def _generate(txn_id: int) -> dict | None:
     retrieval_ms = max(1, round((time.perf_counter() - t0) * 1000))
 
     t1 = time.perf_counter()
-    result = llm.complete_json(SYSTEM, _prompt(txn, prob, rs, hits))
+    result = llm.complete_json(SYSTEM, _prompt(txn, prob, rs, hits))  # one call for all five questions
+    headline = str(result.get("headline", "")).strip()
+    chosen = _answers(result, list(range(len(QUESTIONS))))
+    # Models sometimes answer only one question of several (and a retry for "the rest" peels off one more each time),
+    # so every question still missing is asked on its own, in parallel: a one-question request cannot come back partial.
+    for _ in range(SINGLE_ATTEMPTS):
+        missing = [i for i in range(len(QUESTIONS)) if i not in chosen]
+        if not missing:
+            break
+        with ThreadPoolExecutor(max_workers=len(missing)) as pool:
+            replies = list(pool.map(lambda i: llm.complete_json(SYSTEM, _prompt(txn, prob, rs, hits, [i])), missing))
+        for i, reply in zip(missing, replies):
+            headline = headline or str(reply.get("headline", "")).strip()
+            chosen.update(_answers(reply, [i]))
+    if len(chosen) < len(QUESTIONS):  # an incomplete brief is an error, never "not covered by the policies"
+        raise RuntimeError(f"the model did not answer all {len(QUESTIONS)} questions")
     llm_ms = max(1, round((time.perf_counter() - t1) * 1000))
 
-    answers = {str(i.get("question", "")).strip(): i for i in result.get("items", []) if isinstance(i, dict)}
-    ordered = list(result.get("items", []))
     items = []
     for n, (q, retrieved) in enumerate(zip(QUESTIONS, hits)):
-        item = answers.get(q) or (ordered[n] if n < len(ordered) and isinstance(ordered[n], dict) else {})
+        item = chosen[n]
         verdict, points = _shape(item)
         sources = [s for s in item.get("sources", []) if isinstance(s, int)]
         cites = _citations(sources, retrieved) or _citations([retrieved[0]["chunk_id"]], retrieved)  # fall back to closest chunk
         items.append({"question": q, "verdict": verdict, "points": points, "answer": " ".join(points), "citations": cites})
     facts = {k: txn[k] for k in ("amount_myr", "channel", "merchant_cat", "hour_of_day", "txn_ts")}
     return {"txn_id": txn_id, "prob": prob, "priority": priority_of(prob),
-            "headline": _words(str(result.get("headline", "")).strip(), MAX_HEADLINE_WORDS) or "Review this alert per the fraud SOP.",
+            "headline": _words(headline, MAX_HEADLINE_WORDS) or "Review this alert per the fraud SOP.",
             "facts": facts, "indicators": rs, "items": items, "retrieval_ms": retrieval_ms, "llm_ms": llm_ms}
 
 
