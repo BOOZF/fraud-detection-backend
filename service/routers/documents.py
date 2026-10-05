@@ -37,8 +37,9 @@ MEDIA_TYPES = {"pdf": "application/pdf", "md": "text/markdown; charset=utf-8", "
 
 
 @router.get("/documents/{name}/file")
-def document_file(name: str, chunk: int | None = None):
-    """The original file. With ?chunk=<id> (a PDF citation) the cited passage is highlighted on its page."""
+def document_file(name: str, chunk: int | None = None, quote: str | None = None):
+    """The original file. With ?chunk=<id> (a PDF citation) the cited paragraph is highlighted on its page; with &quote=<sentence>
+    the key sentence inside it gets a stronger highlight."""
     try:
         path = documents.file_path(name)
         kind = documents.kind_of(path.name)
@@ -52,5 +53,5 @@ def document_file(name: str, chunk: int | None = None):
         if not rows:
             raise HTTPException(status_code=404, detail=f"Chunk {chunk} does not belong to '{name}'")
         section, text = rows[0]
-        return Response(highlight.highlighted_pdf(path, section, text), media_type=MEDIA_TYPES[kind], headers=headers)
+        return Response(highlight.highlighted_pdf(path, section, text, (quote or "")[:500]), media_type=MEDIA_TYPES[kind], headers=headers)
     return FileResponse(path, media_type=MEDIA_TYPES[kind], headers=headers)

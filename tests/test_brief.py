@@ -63,11 +63,16 @@ def test_brief_answers_the_standard_questions_with_pdf_page_citations(client, to
     for item in b["items"]:
         assert item["answer"].strip()
         assert len(item["answer"].split()) <= 90, "answers are meant to be brief (prompt asks for <= 60 words)"
-        assert item["citations"], f"no citation for: {item['question']}"
+        if item["verdict"] == "Not covered by policies":
+            assert item["citations"] == []  # never a page under an answer that page does not support
+        else:
+            assert item["citations"] or item["question"] == QUESTIONS[0], f"no citation for: {item['question']}"
         for c in item["citations"]:
             assert c["doc"] in KNOWLEDGE_BASE  # only the ingested PDFs are knowledge sources
             assert isinstance(c["chunk_id"], int) and c["text"].strip()
             assert 1 <= c["page"] <= 131 and c["section"].startswith("p")
+            # the evidence shown with an answer really is on the cited page
+            assert "".join(ch for ch in item["evidence"].lower() if ch.isalnum()) in "".join(ch for ch in c["text"].lower() if ch.isalnum())
 
 
 def test_pdf_citations_carry_the_page_number_to_open():
@@ -92,7 +97,7 @@ def test_brief_for_an_unknown_transaction_is_404(client):
 def test_brief_reports_502_when_the_llm_is_down(client, monkeypatch):
     from service import db
 
-    def boom(system, user):
+    def boom(system, user, model=None):
         raise RuntimeError("network down")
 
     db.clear_cache()

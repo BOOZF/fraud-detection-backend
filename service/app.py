@@ -7,14 +7,14 @@ from teradataml import create_context, remove_context
 
 from . import db
 from .config import get_settings
-from .routers import alerts, chat, copilot, documents, kpis, ml
+from .routers import alerts, chat, copilot, documents, kpis, ml, overview
 
 log = logging.getLogger(__name__)
 
 
 def _prewarm() -> None:
     """Load the read-heavy endpoints into the in-memory cache so the first page load is instant."""
-    for load in (kpis.kpis, ml.model_card, alerts.alerts):
+    for load in (kpis.kpis, ml.model_card, alerts.alerts, overview.overview):
         try:
             load()
         except Exception:
@@ -31,7 +31,10 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         with db.locked():
-            remove_context()
+            try:
+                remove_context()
+            except Exception:
+                log.warning("Teradata connection was already closed at shutdown")
 
 
 app = FastAPI(title="Malaysia XX Bank Fraud Detection Service", lifespan=lifespan)
@@ -44,6 +47,7 @@ app.add_middleware(
 
 
 app.include_router(kpis.router)
+app.include_router(overview.router)
 app.include_router(alerts.router)
 app.include_router(ml.router)
 app.include_router(copilot.router)

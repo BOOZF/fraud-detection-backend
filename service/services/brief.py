@@ -1,12 +1,18 @@
-"""Structured copilot brief for one alert: the questions a fraud analyst must settle, answered from the
-uploaded policies with citations (document, section, PDF page). One retrieval query and one LLM call."""
+"""Structured copilot brief for one alert: the questions a fraud analyst must settle.
+
+* Question 1 (why flagged) and the headline come from the rule-based reason codes and the model score: facts, no LLM.
+* Questions 2-5 are answered from the uploaded policies. The model must say whether an excerpt really answers the
+  question and quote the supporting sentence word for word; the code checks the quote is in the cited chunk. An answer
+  without a verified quote is shown as "Not covered", with no citation, rather than a page that does not support it."""
 import hashlib
-from concurrent.futures import ThreadPoolExecutor
 import json
+import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 
 from .. import data, db, reasons
+from ..config import get_settings
 from ..services import llm, rag
 
 QUESTIONS = [
@@ -16,39 +22,51 @@ QUESTIONS = [
     "Does this need a regulator report?",
     "How should the customer be contacted?",
 ]
+FACTS_QUESTION = 0  # answered from reason codes; the rest need a policy
+POLICY_QUESTIONS = [1, 2, 3, 4]
 
-# What to search for each question, in the vocabulary a procedures document uses. The display questions above stay
-# as they are; these queries only steer the vector + keyword search.
+# What to search for each question. These are written in the vocabulary of a CARD ISSUER's procedures (cards, issuer,
+# cardholder, unauthorised transaction), not of any one document: queries written for an immigration SOP ("referral",
+# "request for evidence") ranked that document's chunks above a bank's own card policy and left every question uncovered.
 RETRIEVAL = [
-    "indicators of fraud: reasons a case is flagged, suspicious indicators and red flags for fraud review",
-    "priority and urgency of a fraud case: timeframe, deadline and response time for handling it",
-    "next steps and procedure when fraud is suspected: investigation, referral and what the officer does next",
-    "when a fraud case must be reported or referred to law enforcement or another agency",
-    "how to contact the subject: interview, request for evidence and communication with the person concerned",
+    "indicators of fraud: reasons a card transaction is flagged, suspicious indicators and red flags for fraud review",
+    "time limit or deadline in days for the card issuer to investigate, respond to or resolve a suspected fraudulent or unauthorised card transaction",
+    "what the card issuer must do when a suspicious or unauthorised card transaction is detected: block the transaction, kill switch, hotline, fraud case investigation procedures",
+    "must the card issuer report a fraud case or suspicious transaction to Bank Negara Malaysia, the police or another authority",
+    "how and when the card issuer must notify or contact the cardholder about a suspicious or blocked card transaction: transaction alerts, SMS, hotline",
 ]
+EXCERPTS_PER_QUESTION = 6
 
 SYSTEM = (
-    "You are the fraud-operations copilot for Malaysia XX Bank. For each numbered question, answer ONLY from the "
-    "CONTEXT of that question (policy excerpts, each starting with [chunk_id]) plus the TRANSACTION facts. "
-    "Write for a bank fraud analyst who skims: every answer has a VERDICT of at most 8 words (a direct answer such as "
-    "'Yes, report to law enforcement' or 'High risk: respond today') and 2 or 3 POINTS, each one short sentence of at "
-    "most 20 words, the first point being the reason. No filler, no repetition of the question. "
-    "When a policy sets a threshold or condition (for example an amount, a probability or a pattern), state the rule "
-    "and say whether THIS transaction meets it, using the TRANSACTION facts: a clear 'No, because ...' or "
-    "'Yes, because ...' is a valid answer and counts as covered. "
-    "Never claim a condition is met unless the TRANSACTION facts show it: compare every number in the policy with "
-    "the actual figures and mention only the conditions that really apply. "
-    "Only if the excerpts say nothing relevant to the question, answer exactly: "
-    "Not covered by the uploaded policies; escalate to a fraud supervisor. and use no sources. "
+    "You are the fraud-operations copilot for Malaysia XX Bank. Each numbered question is about ONE flagged bank card "
+    "payment. Answer ONLY from the CONTEXT of that question (policy excerpts, each starting with [chunk_id]); the "
+    "TRANSACTION facts tell you whether a rule applies to this payment. "
+    "The excerpts may come from documents written for another organisation or another kind of case (for example "
+    "immigration applications or a university). A rule that is about another party or case, such as a deadline for an "
+    "applicant, does NOT answer a question about this card payment. Do not stretch it. "
+    "Set answerable=true only if an excerpt states what is needed to answer THIS question for THIS payment. Then give "
+    "'quote': ONE sentence copied word for word from that excerpt (at least 8 words), and 'sources': its chunk_id. "
+    "Never state a deadline, threshold, amount or procedure that is not in your quote. If no excerpt answers the "
+    "question, set answerable=false and leave verdict, points and quote empty. "
+    "When answerable: a VERDICT of at most 10 words (a direct answer; if it contains a time limit it must say what the limit applies to, for example 'Acknowledge a cardholder dispute within 3 working days') and 2 or 3 POINTS, each one short sentence of at "
+    "most 20 words, that only restate what the quoted sentence says, in plain words: do not add steps, comparisons, "
+    "deadlines, conditions or advice of your own, and say what a time limit applies to. "
     "Never reveal customer identifiers. Return JSON: "
-    '{"headline": "recommended action as one imperative sentence of at most 14 words", "items": [{"question": "<the question>", '
-    '"verdict": "<verdict>", "points": ["<point>", "<point>"], "sources": [<chunk_id numbers actually used>]}]} '
-    'with one item per question, in order.'
+    '{"items": [{"question": "<the question>", "answerable": true or false, "verdict": "<verdict>", '
+    '"points": ["<point>", "<point>"], "quote": "<verbatim sentence>", "sources": [<chunk_id>]}]} '
+    "with EXACTLY one item per question, in order: every question gets an item, never skip one."
 )
 
+NOT_COVERED = "Not covered by the uploaded policies."
+NOT_COVERED_VERDICT = "Not covered by policies"
+MAX_VERDICT_WORDS, MAX_POINTS, MAX_POINT_WORDS = 10, 3, 30
+MIN_QUOTE_CHARS = 25  # shorter than this and a "quote" proves nothing
+ATTEMPTS = 2
+PIPELINE = "grounded-v7"  # bump when the way briefs are built changes, so stored briefs from before are not served
 
-NOT_COVERED = "Not covered by the uploaded policies; escalate to a fraud supervisor."
-MAX_VERDICT_WORDS, MAX_POINTS, MAX_POINT_WORDS, MAX_HEADLINE_WORDS = 10, 3, 30, 25
+
+def priority_of(prob: float) -> str | None:
+    return "P1" if prob >= 0.9 else "P2" if prob >= db.ALERT_THRESHOLD else None
 
 
 def _words(text: str, limit: int) -> str:
@@ -57,11 +75,63 @@ def _words(text: str, limit: int) -> str:
     return " ".join(words[:limit]) + ("..." if len(words) > limit else "")
 
 
-SINGLE_ATTEMPTS = 2
+def _norm(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(text).lower()).strip()
+
+
+VERIFY_SYSTEM = (
+    "You check one answer produced by a bank's fraud copilot. The alert is a flagged bank CARD payment. Decide whether "
+    "the PASSAGE states what is needed to answer the QUESTION for this card payment, and whether the PROPOSED ANSWER is "
+    "what the passage says. Reply applies=false if the passage is about another party, organisation or kind of case "
+    "(for example an immigration applicant, a university, a government agency's own staff), if the answer stretches it "
+    "by analogy, if it adds steps, deadlines or conditions the passage does not state, or if the passage only shares "
+    'words with the question. Return JSON: {"applies": true or false, "why": "<one sentence>"}.'
+)
+
+
+def _applies(qi: int, txn: dict, prob: float, rs: list[str], chunk: dict, item: dict, model: str | None) -> bool:
+    facts = (f"bank card payment RM{txn['amount_myr']:.2f}, channel {txn['channel']}, merchant {txn['merchant_cat']}, "
+             f"fraud probability {prob:.2f}, reason codes: {', '.join(rs)}")
+    user = (f"QUESTION: {QUESTIONS[qi]}\nTRANSACTION: {facts}\nPASSAGE ({chunk['doc']} {chunk['section']}):\n{chunk['text']}\n"
+            f"QUOTED SENTENCE: {item.get('quote', '')}\nPROPOSED ANSWER: {item.get('verdict', '')}. {' '.join(map(str, item.get('points') or []))}")
+    return _is_true(llm.complete_json(VERIFY_SYSTEM, user, model or get_settings().verify_model).get("applies"))
+
+
+def _ask(system: str, user: str, model: str | None) -> dict:
+    """One JSON reply from the model; text that is not valid JSON (a reply that ran on and was cut off) counts as no reply."""
+    try:
+        return llm.complete_json(system, user, model)
+    except ValueError:  # json.JSONDecodeError
+        return {}
+
+
+def _prompt(txn: dict, prob: float, rs: list[str], hits: list[list[dict]], only: list[int]) -> str:
+    facts = (f"amount RM{txn['amount_myr']:.2f}, channel {txn['channel']}, merchant {txn['merchant_cat']}, "
+             f"new_device={txn['device_new']}, foreign={txn['is_foreign']}, hour={txn['hour_of_day']}, "
+             f"amount_vs_30d_avg={txn['amt_ratio_30d']:.1f}x, txns_last_hour={txn['txn_count_1h']}, "
+             f"account_age_days={txn['account_age_days']}")
+    blocks = []
+    for n, i in enumerate(only, start=1):
+        ctx = "\n".join(f"[{h['chunk_id']}] ({h['doc']} {h['section']}) {h['text']}" for h in hits[i])
+        blocks.append(f"QUESTION {n}: {QUESTIONS[i]}\nCONTEXT {n}:\n{ctx}")
+    return (f"TRANSACTION: {facts}\nMODEL: fraud probability {prob:.2f} (priority {priority_of(prob)}). "
+            f"REASON CODES: {', '.join(rs)}\n\n" + "\n\n".join(blocks))
+
+
+def _citation(h: dict, focus: str | None = None) -> dict:
+    return {**{k: h[k] for k in ("doc", "chunk_id", "section", "page", "text")}, "focus": focus}
+
+
+def _verified_chunk(quote: str, retrieved: list[dict]) -> dict | None:
+    """The retrieved chunk that really contains the quoted sentence (ignoring case, spacing and punctuation)."""
+    q = _norm(quote)
+    if len(q) < MIN_QUOTE_CHARS:
+        return None
+    return next((h for h in retrieved if q in _norm(h["text"])), None)
 
 
 def _usable(item) -> bool:
-    return isinstance(item, dict) and (bool(item.get("points")) or bool(str(item.get("answer", "")).strip()))
+    return isinstance(item, dict) and "answerable" in item
 
 
 def _answers(result: dict, asked: list[int]) -> dict[int, dict]:
@@ -77,40 +147,67 @@ def _answers(result: dict, asked: list[int]) -> dict[int, dict]:
     return found
 
 
-def _shape(item: dict) -> tuple[str, list[str]]:
-    points = item.get("points")
-    if not isinstance(points, list):
-        points = [item["answer"]] if str(item.get("answer", "")).strip() else []  # model fell back to the old shape
-    points = [_words(str(p).strip(), MAX_POINT_WORDS) for p in points if str(p).strip()][:MAX_POINTS]
-    verdict = _words(str(item.get("verdict", "")).strip(), MAX_VERDICT_WORDS)
-    if not points:
-        return "Not covered by policies", [NOT_COVERED]
-    return verdict or _words(points[0], 6), points
+def _is_true(value) -> bool:
+    return value is True or str(value).strip().lower() == "true"
 
 
-def priority_of(prob: float) -> str | None:
-    return "P1" if prob >= 0.9 else "P2" if prob >= db.ALERT_THRESHOLD else None
+def _not_covered(qi: int, prob: float) -> dict:
+    points = [NOT_COVERED]
+    if qi == 1:  # urgency: the one thing the system itself knows is the model's priority band
+        points.append(f"Model priority: {priority_of(prob)} ({prob:.0%} fraud probability).")
+    return {"question": QUESTIONS[qi], "verdict": NOT_COVERED_VERDICT, "points": points, "answer": " ".join(points),
+            "evidence": None, "citations": [], "covered": False}
 
 
-def _prompt(txn: dict, prob: float, rs: list[str], hits: list[list[dict]], only: list[int] | None = None) -> str:
-    facts = (f"amount RM{txn['amount_myr']:.2f}, channel {txn['channel']}, merchant {txn['merchant_cat']}, "
-             f"new_device={txn['device_new']}, foreign={txn['is_foreign']}, hour={txn['hour_of_day']}, "
-             f"amount_vs_30d_avg={txn['amt_ratio_30d']:.1f}x, txns_last_hour={txn['txn_count_1h']}, "
-             f"account_age_days={txn['account_age_days']}")
-    blocks = []
-    wanted = range(len(QUESTIONS)) if only is None else only
-    for n, i in enumerate(wanted, start=1):
-        q, chunk_hits = QUESTIONS[i], hits[i]
-        ctx = "\n".join(f"[{h['chunk_id']}] ({h['doc']} {h['section']}) {h['text']}" for h in chunk_hits)
-        blocks.append(f"QUESTION {n}: {q}\nCONTEXT {n}:\n{ctx}")
-    return (f"TRANSACTION: {facts}\nMODEL: fraud probability {prob:.2f} (priority {priority_of(prob)}). "
-            f"REASON CODES: {', '.join(rs)}\n\n" + "\n\n".join(blocks))
+def _candidate(item: dict, retrieved: list[dict]):
+    """(chunk, verdict, points) if the model says an excerpt answers the question AND its quote is really in a retrieved
+    chunk; otherwise None."""
+    chunk = _verified_chunk(item.get("quote", ""), retrieved) if _is_true(item.get("answerable")) else None
+    points = [_words(str(p).strip(), MAX_POINT_WORDS) for p in (item.get("points") or []) if str(p).strip()][:MAX_POINTS]
+    if chunk is None or not points:
+        return None
+    verdict = _words(str(item.get("verdict", "")).strip(), MAX_VERDICT_WORDS) or _words(points[0], 6)
+    return chunk, verdict, points
 
 
-def _citations(source_ids, retrieved: list[dict]) -> list[dict]:
-    by_id = {h["chunk_id"]: h for h in retrieved}
-    wanted = [by_id[i] for i in dict.fromkeys(source_ids) if i in by_id]
-    return [{k: h[k] for k in ("doc", "chunk_id", "section", "page", "text")} for h in wanted]
+def _covered_item(qi: int, item: dict, chunk: dict, verdict: str, points: list[str]) -> dict:
+    return {"question": QUESTIONS[qi], "verdict": verdict, "points": points, "answer": " ".join(points),
+            "evidence": str(item["quote"]).strip(), "citations": [_citation(chunk, str(item["quote"]).strip())], "covered": True}
+
+
+def _reasons_item(prob: float, rs: list[str]) -> dict:
+    """Why it was flagged: the rule-based reason codes and the model score, exactly as the alert page shows them."""
+    points = [f"{r}." for r in rs[:MAX_POINTS]]
+    return {"question": QUESTIONS[FACTS_QUESTION], "verdict": f"{priority_of(prob)} alert: {prob:.0%} fraud probability",
+            "points": points, "answer": " ".join(points), "evidence": None, "citations": [], "covered": True}
+
+
+def _headline(prob: float, rs: list[str]) -> str:
+    return _words(f"Review this {priority_of(prob)} alert: " + ", ".join(r.lower() for r in rs[:3]), 25)
+
+
+def answer_policy_questions(txn: dict, prob: float, rs: list[str], hits: list[list[dict]], model: str | None = None) -> list[dict]:
+    """Questions 2-5, answered by the model and checked against the excerpts. Used by the brief and by the benchmark."""
+    # Each question is asked on its own, in parallel. Measured: gpt-5-mini answers a question well when it is the only
+    # one in the request, and skips or refuses some of them when four are in one request.
+    def ask_one(qi: int) -> dict | None:
+        for _ in range(ATTEMPTS):
+            item = _answers(_ask(SYSTEM, _prompt(txn, prob, rs, hits, [qi]), model), [qi]).get(qi)
+            if item is not None:
+                return item
+        return None
+
+    with ThreadPoolExecutor(max_workers=len(POLICY_QUESTIONS)) as pool:
+        chosen = dict(zip(POLICY_QUESTIONS, pool.map(ask_one, POLICY_QUESTIONS)))
+    if any(item is None for item in chosen.values()):  # an incomplete brief is an error, never "not covered"
+        raise RuntimeError("the model did not answer every policy question")
+    candidates = {i: _candidate(chosen[i], hits[i]) for i in POLICY_QUESTIONS}
+    # A real quote can still be the wrong answer (a rule for another party or case), so each surviving answer is
+    # checked by an independent model call that sees only the question, the transaction and the passage.
+    checked = [i for i in POLICY_QUESTIONS if candidates[i]]
+    with ThreadPoolExecutor(max_workers=max(1, len(checked))) as pool:
+        verdicts = dict(zip(checked, pool.map(lambda i: _applies(i, txn, prob, rs, candidates[i][0], chosen[i], None), checked)))
+    return [_covered_item(i, chosen[i], *candidates[i]) if verdicts.get(i) else _not_covered(i, prob) for i in POLICY_QUESTIONS]
 
 
 def _generate(txn_id: int) -> dict | None:
@@ -122,39 +219,18 @@ def _generate(txn_id: int) -> dict | None:
 
     t0 = time.perf_counter()
     queries = [f"{r} {', '.join(rs)}" if i == 0 else r for i, r in enumerate(RETRIEVAL)]
-    hits = rag.retrieve_many(queries, k=4)
+    hits = rag.retrieve_many(queries, k=EXCERPTS_PER_QUESTION)
     retrieval_ms = max(1, round((time.perf_counter() - t0) * 1000))
 
     t1 = time.perf_counter()
-    result = llm.complete_json(SYSTEM, _prompt(txn, prob, rs, hits))  # one call for all five questions
-    headline = str(result.get("headline", "")).strip()
-    chosen = _answers(result, list(range(len(QUESTIONS))))
-    # Models sometimes answer only one question of several (and a retry for "the rest" peels off one more each time),
-    # so every question still missing is asked on its own, in parallel: a one-question request cannot come back partial.
-    for _ in range(SINGLE_ATTEMPTS):
-        missing = [i for i in range(len(QUESTIONS)) if i not in chosen]
-        if not missing:
-            break
-        with ThreadPoolExecutor(max_workers=len(missing)) as pool:
-            replies = list(pool.map(lambda i: llm.complete_json(SYSTEM, _prompt(txn, prob, rs, hits, [i])), missing))
-        for i, reply in zip(missing, replies):
-            headline = headline or str(reply.get("headline", "")).strip()
-            chosen.update(_answers(reply, [i]))
-    if len(chosen) < len(QUESTIONS):  # an incomplete brief is an error, never "not covered by the policies"
-        raise RuntimeError(f"the model did not answer all {len(QUESTIONS)} questions")
+    policy_items = answer_policy_questions(txn, prob, rs, hits)
     llm_ms = max(1, round((time.perf_counter() - t1) * 1000))
 
-    items = []
-    for n, (q, retrieved) in enumerate(zip(QUESTIONS, hits)):
-        item = chosen[n]
-        verdict, points = _shape(item)
-        sources = [s for s in item.get("sources", []) if isinstance(s, int)]
-        cites = _citations(sources, retrieved) or _citations([retrieved[0]["chunk_id"]], retrieved)  # fall back to closest chunk
-        items.append({"question": q, "verdict": verdict, "points": points, "answer": " ".join(points), "citations": cites})
     facts = {k: txn[k] for k in ("amount_myr", "channel", "merchant_cat", "hour_of_day", "txn_ts")}
-    return {"txn_id": txn_id, "prob": prob, "priority": priority_of(prob),
-            "headline": _words(headline, MAX_HEADLINE_WORDS) or "Review this alert per the fraud SOP.",
-            "facts": facts, "indicators": rs, "items": items, "retrieval_ms": retrieval_ms, "llm_ms": llm_ms}
+    return {"txn_id": txn_id, "prob": prob, "priority": priority_of(prob), "headline": _headline(prob, rs),
+            "facts": facts, "indicators": rs, "items": [_reasons_item(prob, rs), *policy_items],
+            "coverage": {"covered": sum(i["covered"] for i in policy_items), "total": len(policy_items)},
+            "retrieval_ms": retrieval_ms, "llm_ms": llm_ms}
 
 
 # ---------- stored briefs: an alert's brief is generated once and then read back, so it never changes ----------
@@ -164,9 +240,10 @@ CACHE_DDL = ("CREATE TABLE copilot_briefs (txn_id INTEGER NOT NULL, kb_key VARCH
 
 
 def kb_key() -> str:
-    """Fingerprint of the knowledge base. A stored brief is only valid for the documents it was written from."""
+    """Fingerprint of everything a brief depends on: the documents, the model and the pipeline version. A stored
+    brief is only valid for the combination it was written from."""
     rows = db.query("SELECT doc, chunks, CAST(uploaded_at AS VARCHAR(19)) FROM policy_docs ORDER BY doc")
-    return hashlib.sha256(json.dumps(rows, default=str).encode()).hexdigest()[:32]
+    return hashlib.sha256(json.dumps([rows, get_settings().llm_model, PIPELINE], default=str).encode()).hexdigest()[:32]
 
 
 @lru_cache(maxsize=1)
