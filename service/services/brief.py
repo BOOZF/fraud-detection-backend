@@ -62,7 +62,7 @@ NOT_COVERED_VERDICT = "Not covered by policies"
 MAX_VERDICT_WORDS, MAX_POINTS, MAX_POINT_WORDS = 10, 3, 30
 MIN_QUOTE_CHARS = 25  # shorter than this and a "quote" proves nothing
 ATTEMPTS = 2
-PIPELINE = "grounded-v7"  # bump when the way briefs are built changes, so stored briefs from before are not served
+PIPELINE = "grounded-v8"  # bump when the way briefs are built changes, so stored briefs from before are not served
 
 
 def priority_of(prob: float) -> str | None:
@@ -85,7 +85,12 @@ VERIFY_SYSTEM = (
     "what the passage says. Reply applies=false if the passage is about another party, organisation or kind of case "
     "(for example an immigration applicant, a university, a government agency's own staff), if the answer stretches it "
     "by analogy, if it adds steps, deadlines or conditions the passage does not state, or if the passage only shares "
-    'words with the question. Return JSON: {"applies": true or false, "why": "<one sentence>"}.'
+    'words with the question. Also compare WHAT STARTS the duty or deadline in the passage with the situation here: this '
+    "alert was raised by the bank's own fraud model, not by a customer report. A duty or time limit that only starts when a "
+    "customer lodges a dispute or report (acknowledge it, request information within N days) does NOT answer how urgent a "
+    "bank-detected alert is or what the analyst's response deadline is: reply applies=false. A passage that states how the "
+    "issuer must alert or notify the cardholder about suspicious or unauthorised transactions (channels, contact details) "
+    'DOES answer how to contact the customer. Return JSON: {"applies": true or false, "why": "<one sentence>"}.'
 )
 
 
